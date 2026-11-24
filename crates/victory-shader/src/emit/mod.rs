@@ -527,16 +527,23 @@ mod tests {
             0x7E04_0300,    // v_mov_b32 v2, v0
             0x7DA8_0090,    // v_cmpx_gt_u32 16, v0: the rest runs in lanes 0..15
         ];
-        // ds_write_b8, _b16, _b8_d16_hi, _b16_d16_hi of v2.
-        for (op, offset) in [(0x1E, 1), (0x1F, 2), (0xA0, 4), (0xA1, 6)] {
+        // ds_write_b8, _b16, _b8_d16_hi, _b16_d16_hi of v2; halves also
+        // across two dwords (byte 3) and at the last byte of LDS (511).
+        for (op, offset) in [(0x1E, 1), (0x1F, 2), (0xA0, 4), (0xA1, 6)]
+            .into_iter()
+            .chain([(0x1F, 3), (0xA1, 511)])
+        {
             words.extend(ds(op, 0, 2, offset));
         }
         // Reads into v3, each written back as a dword.
-        for (k, op) in [0x39, 0x3A, 0x3B, 0x3C, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7]
+        let reads = [0x39, 0x3A, 0x3B, 0x3C, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7];
+        let at = [2, 3, 511];
+        for (k, (op, offset)) in reads
             .into_iter()
+            .flat_map(|op| at.map(|o| (op, o)))
             .enumerate()
         {
-            words.extend(ds(op, 3, 0, 2));
+            words.extend(ds(op, 3, 0, offset));
             words.extend(ds(0x0D, 0, 3, 8 + 4 * k as u32)); // ds_write_b32 v1, v3
         }
         words.push(0xBF81_0000); // s_endpgm

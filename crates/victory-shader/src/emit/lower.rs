@@ -2284,8 +2284,7 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// LDS reads and writes of a byte or a half at byte address `a + offset`,
-    /// within the dword that holds it.
+    /// LDS reads and writes of a byte or a half at byte address `a + offset`.
     fn ds_narrow(
         &mut self,
         inst: &Inst,
@@ -2305,21 +2304,42 @@ impl<'a> Lower<'a> {
         let index = self.s.m.bin(c, Bin::LShr, at, two);
         let lds = self.s.lds();
         let p = self.s.m.element(c, lds, index);
-        // shortcut: halves are taken as 2-byte aligned, as dwords are taken
-        // as dword-aligned; an unaligned half would span two dwords.
-        let within = k(self, if n.bits == 8 { 3 } else { 2 });
-        let byte = self.s.m.bin(c, Bin::And, at, within);
         let three = k(self, 3);
+        let byte = self.s.m.bin(c, Bin::And, at, three);
         let shift = self.s.m.bin(c, Bin::Shl, byte, three);
         let mask = (1u32 << n.bits) - 1;
+        // A half at byte 3 runs into the next dword, as RDNA2 reads and
+        // writes it. Past the end of LDS that byte reads as 0 and is not
+        // written, as out-of-bounds bytes on the console.
+        let straddle = (n.bits == 16).then(|| {
+            let one = k(self, 1);
+            let next = self.s.m.bin(c, Bin::Add, index, one);
+            let last = k(self, self.s.lds_dwords - 1);
+            let inside = self.s.m.cmp(c, pred::IULE, next, last);
+            let next = self.s.m.select(c, inside, next, last);
+            let q = self.s.m.element(c, lds, next);
+            let at3 = self.s.m.cmp(c, pred::EQ, byte, three);
+            (q, self.s.m.bin(c, Bin::And, at3, inside))
+        });
         if !n.write {
             let reg = match dst {
                 Some(Operand::Vector { reg, .. }) => *reg,
                 _ => return Err("an LDS read result"),
             };
             let word = self.s.m.load(c, p);
-            let bits = k(self, n.bits);
-            let x = self.bfe(word, shift, bits, n.signed);
+            let low = self.s.m.bin(c, Bin::LShr, word, shift);
+            let x = match straddle {
+                Some((q, crosses)) => {
+                    let next = self.s.m.load(c, q);
+                    let eight = k(self, 8);
+                    let high = self.s.m.bin(c, Bin::Shl, next, eight);
+                    let both = self.s.m.bin(c, Bin::Or, low, high);
+                    self.s.m.select(c, crosses, both, low)
+                }
+                None => low,
+            };
+            let (zero, bits) = (k(self, 0), k(self, n.bits));
+            let x = self.bfe(x, zero, bits, n.signed);
             let x = match n.half {
                 None => x,
                 Some(high) => {
@@ -2350,14 +2370,30 @@ impl<'a> Lower<'a> {
         };
         let m = k(self, mask);
         let v = self.s.m.bin(c, Bin::And, v, m);
-        let v = self.s.m.bin(c, Bin::Shl, v, shift);
+        // Bits shifted past the dword are the next dword's (a straddling half).
+        let low = self.s.m.bin(c, Bin::Shl, v, shift);
         let m = self.s.m.bin(c, Bin::Shl, m, shift);
         let ones = k(self, u32::MAX);
         let keep = self.s.m.bin(c, Bin::Xor, m, ones);
-        // Lanes writing other bytes of the same dword must not undo each
-        // other's writes: the dword is replaced by compare-exchange, retried
-        // until no other lane changed it in between.
         let at = self.begin_guarded(guard);
+        self.lds_replace(p, keep, low);
+        if let Some((q, crosses)) = straddle {
+            let eight = k(self, 8);
+            let high = self.s.m.bin(c, Bin::LShr, v, eight);
+            let keep = k(self, !0xFF);
+            let at = self.begin_guarded(Some(crosses));
+            self.lds_replace(q, keep, high);
+            self.end_guarded(at, &[]);
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    /// Replaces the bits of the LDS dword at `p` outside `keep` with `v`'s.
+    /// Lanes writing other bytes of the same dword must not undo each other's
+    /// writes: the dword is replaced by compare-exchange, retried until no
+    /// other lane changed it in between.
+    fn lds_replace(&mut self, p: V, keep: V, v: V) {
         let (head, spin, done) = (self.cur, self.s.m.new_block(), self.s.m.new_block());
         let first = self.s.m.load(head, p);
         self.s.m.terminate(head, Term::Br(spin));
@@ -2370,8 +2406,6 @@ impl<'a> Lower<'a> {
         let stored = self.s.m.cmp(spin, pred::EQ, seen, cur);
         self.s.m.terminate(spin, Term::CondBr(stored, done, spin));
         self.cur = done;
-        self.end_guarded(at, &[]);
-        Ok(())
     }
 
     // ---- instructions ----
