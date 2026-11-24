@@ -13,6 +13,7 @@ use crate::native::{
 use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
+const S_BARRIER: u32 = 0xBF8A_0000;
 
 /// SOP1 `s_mov_b32 sdst, src0`.
 const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
@@ -80,7 +81,9 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     build_cs(body, 0)
 }
 
-/// [`build_valu_cs`] with `lds_granules` 512-byte granules of LDS.
+/// [`build_valu_cs`] with `lds_granules` 512-byte granules of LDS. With
+/// LDS, 64 threads run `body` alike: a group of one wave would ask the host
+/// for 32-lane waves, which WARP does not have.
 fn build_cs(body: &[u32], lds_granules: u32) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
@@ -130,7 +133,7 @@ fn build_cs(body: &[u32], lds_granules: u32) -> HostShader {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1 | lds_granules << 15, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            threads: [if lds_granules > 0 { 64 } else { 1 }, 1, 1],
         }),
         code,
     };
@@ -969,7 +972,9 @@ fn lds_narrow_writes_replace_their_bytes() {
         for off in (0..4).step_by(bits as usize / 8) {
             let mut body = vec![vop1(0x001, 5, 128)]; // v_mov_b32 v5, 0
             body.extend(ds(0x0D, 0, 5, 4, 0)); // ds_write_b32 v5, v4
+            body.push(S_BARRIER);
             body.extend(ds(op, 0, 5, 1, off as u16));
+            body.push(S_BARRIER);
             body.extend(ds(0x36, 0, 5, 0, 0)); // ds_read_b32 v0, v5
             let shader = build_cs(&body, 1);
             run_cases(&shader, &LDS_CASES, |backend, _, inp, got| {
