@@ -336,6 +336,49 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// An LDS read or write of a byte or a half.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Narrow {
+    write: bool,
+    bits: u32,
+    /// Reads: sign-extended rather than zero-extended.
+    signed: bool,
+    /// d16 forms: the value is the high (`Some(true)`) or low half of the
+    /// register; the register's other half is kept by reads.
+    half: Option<bool>,
+}
+
+impl Narrow {
+    fn of(name: &str) -> Option<Self> {
+        let (write, rest) = match name.strip_prefix("ds_read_") {
+            Some(r) => (false, r),
+            None => (true, name.strip_prefix("ds_write_")?),
+        };
+        let (ty, half) = if let Some(t) = rest.strip_suffix("_d16_hi") {
+            (t, Some(true))
+        } else if let Some(t) = rest.strip_suffix("_d16") {
+            (t, Some(false))
+        } else {
+            (rest, None)
+        };
+        let (signed, bits) = match (write, ty) {
+            (false, "u8") => (false, 8),
+            (false, "i8") => (true, 8),
+            (false, "u16") => (false, 16),
+            (false, "i16") => (true, 16),
+            (true, "b8") => (false, 8),
+            (true, "b16") => (false, 16),
+            _ => return None,
+        };
+        Some(Self {
+            write,
+            bits,
+            signed,
+            half,
+        })
+    }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -2148,6 +2191,9 @@ impl<'a> Lower<'a> {
                 (u32::from(*offset1) * scale, w),
             ]
         };
+        if let Some(narrow) = Narrow::of(name) {
+            return self.ds_narrow(inst, narrow, a, offset, guard);
+        }
         if let Some(rest) = name.strip_prefix("ds_read") {
             let elements = if rest.starts_with('2') {
                 pair(name)
@@ -2235,6 +2281,96 @@ impl<'a> Lower<'a> {
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);
         }
+        Ok(())
+    }
+
+    /// LDS reads and writes of a byte or a half at byte address `a + offset`,
+    /// within the dword that holds it.
+    fn ds_narrow(
+        &mut self,
+        inst: &Inst,
+        n: Narrow,
+        a: V,
+        offset: u32,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let Fields::Ds { dst, data, .. } = &inst.fields else {
+            unreachable!()
+        };
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let o = k(self, offset);
+        let at = self.s.m.bin(c, Bin::Add, a, o);
+        let two = k(self, 2);
+        let index = self.s.m.bin(c, Bin::LShr, at, two);
+        let lds = self.s.lds();
+        let p = self.s.m.element(c, lds, index);
+        // shortcut: halves are taken as 2-byte aligned, as dwords are taken
+        // as dword-aligned; an unaligned half would span two dwords.
+        let within = k(self, if n.bits == 8 { 3 } else { 2 });
+        let byte = self.s.m.bin(c, Bin::And, at, within);
+        let three = k(self, 3);
+        let shift = self.s.m.bin(c, Bin::Shl, byte, three);
+        let mask = (1u32 << n.bits) - 1;
+        if !n.write {
+            let reg = match dst {
+                Some(Operand::Vector { reg, .. }) => *reg,
+                _ => return Err("an LDS read result"),
+            };
+            let word = self.s.m.load(c, p);
+            let bits = k(self, n.bits);
+            let x = self.bfe(word, shift, bits, n.signed);
+            let x = match n.half {
+                None => x,
+                Some(high) => {
+                    let old = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
+                    let old = self.i32_of(old)?;
+                    let (low16, high16) = (k(self, 0xFFFF), k(self, 0xFFFF_0000));
+                    let x = self.s.m.bin(c, Bin::And, x, low16);
+                    if high {
+                        let sixteen = k(self, 16);
+                        let x = self.s.m.bin(c, Bin::Shl, x, sixteen);
+                        let keep = self.s.m.bin(c, Bin::And, old, low16);
+                        self.s.m.bin(c, Bin::Or, x, keep)
+                    } else {
+                        let keep = self.s.m.bin(c, Bin::And, old, high16);
+                        self.s.m.bin(c, Bin::Or, x, keep)
+                    }
+                }
+            };
+            self.write(inst, Reg::V(reg), x, guard);
+            return Ok(());
+        }
+        let v = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+        let v = if n.half == Some(true) {
+            let sixteen = k(self, 16);
+            self.s.m.bin(c, Bin::LShr, v, sixteen)
+        } else {
+            v
+        };
+        let m = k(self, mask);
+        let v = self.s.m.bin(c, Bin::And, v, m);
+        let v = self.s.m.bin(c, Bin::Shl, v, shift);
+        let m = self.s.m.bin(c, Bin::Shl, m, shift);
+        let ones = k(self, u32::MAX);
+        let keep = self.s.m.bin(c, Bin::Xor, m, ones);
+        // Lanes writing other bytes of the same dword must not undo each
+        // other's writes: the dword is replaced by compare-exchange, retried
+        // until no other lane changed it in between.
+        let at = self.begin_guarded(guard);
+        let (head, spin, done) = (self.cur, self.s.m.new_block(), self.s.m.new_block());
+        let first = self.s.m.load(head, p);
+        self.s.m.terminate(head, Term::Br(spin));
+        let ty = self.s.m.type_of(first);
+        let cur = self.s.m.phi(spin, ty);
+        let kept = self.s.m.bin(spin, Bin::And, cur, keep);
+        let new = self.s.m.bin(spin, Bin::Or, kept, v);
+        let seen = self.s.m.cmpxchg(spin, p, cur, new);
+        self.s.m.set_phi(cur, vec![(first, head), (seen, spin)]);
+        let stored = self.s.m.cmp(spin, pred::EQ, seen, cur);
+        self.s.m.terminate(spin, Term::CondBr(stored, done, spin));
+        self.cur = done;
+        self.end_guarded(at, &[]);
         Ok(())
     }
 

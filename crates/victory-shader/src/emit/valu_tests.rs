@@ -65,10 +65,23 @@ const fn vgpr(n: u8) -> u16 {
     256 + n as u16
 }
 
+/// DS `op vdst, vaddr, vdata0 offset:offset`.
+const fn ds(op: u8, vdst: u8, addr: u8, data0: u8, offset: u16) -> [u32; 2] {
+    [
+        0x36 << 26 | (op as u32) << 18 | offset as u32,
+        (vdst as u32) << 24 | (data0 as u32) << 8 | addr as u32,
+    ]
+}
+
 /// Builds and lowers a 1-thread synthetic RDNA2 compute shader that receives
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_cs(body, 0)
+}
+
+/// [`build_valu_cs`] with `lds_granules` 512-byte granules of LDS.
+fn build_cs(body: &[u32], lds_granules: u32) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -116,7 +129,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+            rsrc2: 5 << 1 | lds_granules << 15, // 5 user SGPRs: s0..s4
             threads: [1, 1, 1],
         }),
         code,
@@ -932,4 +945,89 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+/// Inputs of the LDS tests: data, the destination's old value, unused, and
+/// what the LDS dword holds before a narrow write.
+const LDS_CASES: [[u32; 4]; 3] = [
+    [0x8C7F_E1A3, 0x1234_5678, 0, 0xDEAD_BEEF],
+    [0x7F01_80FF, 0xFFFF_FFFF, 0, 0],
+    [0x0000_0000, 0x0000_0000, 0, 0xFFFF_FFFF],
+];
+
+/// `ds_write_b8`/`_b16` (and their `_d16_hi` forms) replace only their
+/// byte or half of the dword.
+#[test]
+fn lds_narrow_writes_replace_their_bytes() {
+    let ops: [(&str, u8, u32, bool); 4] = [
+        ("ds_write_b8", 0x1E, 8, false),
+        ("ds_write_b16", 0x1F, 16, false),
+        ("ds_write_b8_d16_hi", 0xA0, 8, true),
+        ("ds_write_b16_d16_hi", 0xA1, 16, true),
+    ];
+    for (name, op, bits, hi) in ops {
+        for off in (0..4).step_by(bits as usize / 8) {
+            let mut body = vec![vop1(0x001, 5, 128)]; // v_mov_b32 v5, 0
+            body.extend(ds(0x0D, 0, 5, 4, 0)); // ds_write_b32 v5, v4
+            body.extend(ds(op, 0, 5, 1, off as u16));
+            body.extend(ds(0x36, 0, 5, 0, 0)); // ds_read_b32 v0, v5
+            let shader = build_cs(&body, 1);
+            run_cases(&shader, &LDS_CASES, |backend, _, inp, got| {
+                let mask = (1u32 << bits) - 1;
+                let v = if hi { inp[0] >> 16 } else { inp[0] } & mask;
+                let want = inp[3] & !(mask << (8 * off)) | v << (8 * off);
+                assert_eq!(
+                    got, want,
+                    "{backend}: {name} offset:{off} of {:#010x} over {:#010x}",
+                    inp[0], inp[3],
+                );
+            });
+        }
+    }
+}
+
+/// `ds_read_{u,i}{8,16}` extend their byte or half; the d16 forms write a
+/// half of the destination and keep the other.
+#[test]
+fn lds_narrow_reads_extend_or_keep_halves() {
+    // (name, opcode, bits, signed, d16: high half)
+    let ops: [(&str, u8, u32, bool, Option<bool>); 10] = [
+        ("ds_read_i8", 0x39, 8, true, None),
+        ("ds_read_u8", 0x3A, 8, false, None),
+        ("ds_read_i16", 0x3B, 16, true, None),
+        ("ds_read_u16", 0x3C, 16, false, None),
+        ("ds_read_u8_d16", 0xA2, 8, false, Some(false)),
+        ("ds_read_u8_d16_hi", 0xA3, 8, false, Some(true)),
+        ("ds_read_i8_d16", 0xA4, 8, true, Some(false)),
+        ("ds_read_i8_d16_hi", 0xA5, 8, true, Some(true)),
+        ("ds_read_u16_d16", 0xA6, 16, false, Some(false)),
+        ("ds_read_u16_d16_hi", 0xA7, 16, false, Some(true)),
+    ];
+    for (name, op, bits, signed, half) in ops {
+        for off in (0..4).step_by(bits as usize / 8) {
+            let mut body = vec![vop1(0x001, 5, 128)]; // v_mov_b32 v5, 0
+            body.extend(ds(0x0D, 0, 5, 1, 0)); // ds_write_b32 v5, v1
+            body.push(vop1(0x001, 0, vgpr(2))); // v_mov_b32 v0, v2
+            body.extend(ds(op, 0, 5, 0, off as u16));
+            let shader = build_cs(&body, 1);
+            run_cases(&shader, &LDS_CASES, |backend, _, inp, got| {
+                let x = inp[0] >> (8 * off) & ((1u32 << bits) - 1);
+                let x = if signed {
+                    ((x << (32 - bits)) as i32 >> (32 - bits)) as u32
+                } else {
+                    x
+                };
+                let want = match half {
+                    None => x,
+                    Some(false) => inp[1] & 0xFFFF_0000 | x & 0xFFFF,
+                    Some(true) => inp[1] & 0xFFFF | x << 16,
+                };
+                assert_eq!(
+                    got, want,
+                    "{backend}: {name} offset:{off} of {:#010x} into {:#010x}",
+                    inp[0], inp[1],
+                );
+            });
+        }
+    }
 }

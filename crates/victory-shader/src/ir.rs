@@ -841,6 +841,10 @@ fn effects(
             }
             if let Some(d) = dst {
                 regs(d, &mut w)?;
+                // A d16 read keeps the other half of its destination.
+                if name.contains("_d16") {
+                    regs(d, &mut r)?;
+                }
             }
             if *gds
                 || name.starts_with("ds_gws")
