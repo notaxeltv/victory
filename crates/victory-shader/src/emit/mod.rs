@@ -515,6 +515,66 @@ mod tests {
         }
     }
 
+    /// LDS reads and writes of bytes and halves, every form, translate.
+    #[test]
+    fn narrow_lds_accesses_translate() {
+        let ds = |op: u32, vdst: u32, data0: u32, offset: u32| {
+            // Address in v1.
+            [0xD800_0000 | op << 18 | offset, vdst << 24 | data0 << 8 | 1]
+        };
+        let mut words = vec![
+            0x7E02_0280u32, // v_mov_b32 v1, 0
+            0x7E04_0300,    // v_mov_b32 v2, v0
+            0x7DA8_0090,    // v_cmpx_gt_u32 16, v0: the rest runs in lanes 0..15
+        ];
+        // ds_write_b8, _b16, _b8_d16_hi, _b16_d16_hi of v2; halves also
+        // across two dwords (byte 3) and at the last byte of LDS (511).
+        for (op, offset) in [(0x1E, 1), (0x1F, 2), (0xA0, 4), (0xA1, 6)]
+            .into_iter()
+            .chain([(0x1F, 3), (0xA1, 511)])
+        {
+            words.extend(ds(op, 0, 2, offset));
+        }
+        // Reads into v3, each written back as a dword.
+        let reads = [0x39, 0x3A, 0x3B, 0x3C, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7];
+        let at = [2, 3, 511];
+        for (k, (op, offset)) in reads
+            .into_iter()
+            .flat_map(|op| at.map(|o| (op, o)))
+            .enumerate()
+        {
+            words.extend(ds(op, 3, 0, offset));
+            words.extend(ds(0x0D, 0, 3, 8 + 4 * k as u32)); // ds_write_b32 v1, v3
+        }
+        words.push(0xBF81_0000); // s_endpgm
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15, // 512 bytes of LDS; v0 = thread id x
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let container = crate::dxbc::build(&[]);
+        let c = Container::parse(&container).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+        assert!(!out.dxil.is_empty());
+    }
+
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
     fn constant_color() -> Vec<u8> {

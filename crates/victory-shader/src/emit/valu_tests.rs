@@ -13,6 +13,7 @@ use crate::native::{
 use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
+const S_BARRIER: u32 = 0xBF8A_0000;
 
 /// SOP1 `s_mov_b32 sdst, src0`.
 const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
@@ -65,10 +66,25 @@ const fn vgpr(n: u8) -> u16 {
     256 + n as u16
 }
 
+/// DS `op vdst, vaddr, vdata0 offset:offset`.
+const fn ds(op: u8, vdst: u8, addr: u8, data0: u8, offset: u16) -> [u32; 2] {
+    [
+        0x36 << 26 | (op as u32) << 18 | offset as u32,
+        (vdst as u32) << 24 | (data0 as u32) << 8 | addr as u32,
+    ]
+}
+
 /// Builds and lowers a 1-thread synthetic RDNA2 compute shader that receives
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_cs(body, 0)
+}
+
+/// [`build_valu_cs`] with `lds_granules` 512-byte granules of LDS. With
+/// LDS, 64 threads run `body` alike: a group of one wave would ask the host
+/// for 32-lane waves, which WARP does not have.
+fn build_cs(body: &[u32], lds_granules: u32) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -116,8 +132,8 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            rsrc2: 5 << 1 | lds_granules << 15, // 5 user SGPRs: s0..s4
+            threads: [if lds_granules > 0 { 64 } else { 1 }, 1, 1],
         }),
         code,
     };
@@ -932,4 +948,124 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+/// Inputs of the LDS tests: data, the destination's old value, the second
+/// LDS dword, and the first LDS dword before a narrow write.
+const LDS_CASES: [[u32; 4]; 3] = [
+    [0x8C7F_E1A3, 0x1234_5678, 0x0BAD_F00D, 0xDEAD_BEEF],
+    [0x7F01_80FF, 0xFFFF_FFFF, 0x80FF_7F01, 0],
+    [0x0000_0000, 0x0000_0000, 0xFFFF_FFFF, 0xFFFF_FFFF],
+];
+
+/// Where the LDS tests address: two dwords at the start of the group's 512
+/// bytes, and its last dword, past which bytes read as 0 and are not written.
+const LDS_BASES: [(u32, usize); 2] = [(0, 2), (508, 1)];
+
+/// `v_mov_b32 v5, base`, then the LDS dwords at `base` from `vgprs`.
+fn lds_setup(base: u32, vgprs: &[u8]) -> Vec<u32> {
+    let mut body = vec![vop1(0x001, 5, 255), base]; // v_mov_b32 v5, base
+    for (k, &v) in vgprs.iter().enumerate() {
+        body.extend(ds(0x0D, 0, 5, v, 4 * k as u16)); // ds_write_b32 v5, v offset:4k
+    }
+    body
+}
+
+fn le_bytes(dwords: &[u32]) -> Vec<u8> {
+    dwords.iter().flat_map(|d| d.to_le_bytes()).collect()
+}
+
+/// `ds_write_b8`/`_b16` (and their `_d16_hi` forms) replace only their
+/// bytes, a half at byte 3 the next dword's first byte too.
+#[test]
+fn lds_narrow_writes_replace_their_bytes() {
+    let ops: [(&str, u8, usize, bool); 4] = [
+        ("ds_write_b8", 0x1E, 1, false),
+        ("ds_write_b16", 0x1F, 2, false),
+        ("ds_write_b8_d16_hi", 0xA0, 1, true),
+        ("ds_write_b16_d16_hi", 0xA1, 2, true),
+    ];
+    for (name, op, bytes, hi) in ops {
+        for (base, words) in LDS_BASES {
+            for off in 0..4 {
+                for word in 0..words {
+                    let mut body = lds_setup(base, &[4, 3][..words]);
+                    body.push(S_BARRIER);
+                    body.extend(ds(op, 0, 5, 1, off as u16));
+                    body.push(S_BARRIER);
+                    body.extend(ds(0x36, 0, 5, 0, 4 * word as u16)); // ds_read_b32 v0
+                    let shader = build_cs(&body, 1);
+                    run_cases(&shader, &LDS_CASES, |backend, _, inp, got| {
+                        let mut lds = le_bytes(&[inp[3], inp[2]][..words]);
+                        let data = if hi { inp[0] >> 16 } else { inp[0] }.to_le_bytes();
+                        for (b, &d) in data[..bytes].iter().enumerate() {
+                            if let Some(x) = lds.get_mut(off + b) {
+                                *x = d;
+                            }
+                        }
+                        let want = u32::from_le_bytes(lds[4 * word..][..4].try_into().unwrap());
+                        assert_eq!(
+                            got, want,
+                            "{backend}: {name} at {base}+{off}, dword {word}, of {:#010x}",
+                            inp[0],
+                        );
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// `ds_read_{u,i}{8,16}` extend their byte or half (a half at byte 3 takes
+/// the next dword's first byte); the d16 forms write a half of the
+/// destination and keep the other.
+#[test]
+fn lds_narrow_reads_extend_or_keep_halves() {
+    // (name, opcode, bytes, signed, d16: high half)
+    let ops: [(&str, u8, usize, bool, Option<bool>); 10] = [
+        ("ds_read_i8", 0x39, 1, true, None),
+        ("ds_read_u8", 0x3A, 1, false, None),
+        ("ds_read_i16", 0x3B, 2, true, None),
+        ("ds_read_u16", 0x3C, 2, false, None),
+        ("ds_read_u8_d16", 0xA2, 1, false, Some(false)),
+        ("ds_read_u8_d16_hi", 0xA3, 1, false, Some(true)),
+        ("ds_read_i8_d16", 0xA4, 1, true, Some(false)),
+        ("ds_read_i8_d16_hi", 0xA5, 1, true, Some(true)),
+        ("ds_read_u16_d16", 0xA6, 2, false, Some(false)),
+        ("ds_read_u16_d16_hi", 0xA7, 2, false, Some(true)),
+    ];
+    for (name, op, bytes, signed, half) in ops {
+        for (base, words) in LDS_BASES {
+            for off in 0..4 {
+                let mut body = lds_setup(base, &[1, 3][..words]);
+                body.push(vop1(0x001, 0, vgpr(2))); // v_mov_b32 v0, v2
+                body.extend(ds(op, 0, 5, 0, off as u16));
+                let shader = build_cs(&body, 1);
+                run_cases(&shader, &LDS_CASES, |backend, _, inp, got| {
+                    let lds = le_bytes(&[inp[0], inp[2]][..words]);
+                    let mut x = [0u8; 4];
+                    for (b, d) in x[..bytes].iter_mut().enumerate() {
+                        *d = lds.get(off + b).copied().unwrap_or(0);
+                    }
+                    let bits = 8 * bytes as u32;
+                    let x = u32::from_le_bytes(x);
+                    let x = if signed {
+                        ((x << (32 - bits)) as i32 >> (32 - bits)) as u32
+                    } else {
+                        x
+                    };
+                    let want = match half {
+                        None => x,
+                        Some(false) => inp[1] & 0xFFFF_0000 | x & 0xFFFF,
+                        Some(true) => inp[1] & 0xFFFF | x << 16,
+                    };
+                    assert_eq!(
+                        got, want,
+                        "{backend}: {name} at {base}+{off} of {:08x?} into {:#010x}",
+                        lds, inp[1],
+                    );
+                });
+            }
+        }
+    }
 }
